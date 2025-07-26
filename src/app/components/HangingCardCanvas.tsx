@@ -15,9 +15,10 @@ const HangingCardCanvas: React.FC = () => {
 
         // --- Basic Setup ---
         let scene: THREE.Scene, camera: THREE.PerspectiveCamera, renderer: THREE.WebGLRenderer, controls: OrbitControls;
-        let world: CANNON.World, spring: CANNON.Spring, cannonDebugger: ReturnType<typeof CannonDebugger>;
+        let world: CANNON.World, cannonDebugger: ReturnType<typeof CannonDebugger>;
         let cardMesh: THREE.Mesh, cardBody: CANNON.Body, anchorBody: CANNON.Body;
         let ropeLine: THREE.Line;
+        const ropeSegments: CANNON.Body[] = [];
         let isDragging = false;
         const raycaster = new THREE.Raycaster();
         const mouse = new THREE.Vector2();
@@ -46,6 +47,11 @@ const HangingCardCanvas: React.FC = () => {
             controls = new OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
             controls.target.set(0, 10, 0);
+            // Disable all camera controls and zoom
+            controls.enabled = false;
+            controls.enableZoom = false;
+            controls.enablePan = false;
+            controls.enableRotate = false;
 
             // Lighting
             const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
@@ -65,14 +71,69 @@ const HangingCardCanvas: React.FC = () => {
         const initPhysics = () => {
             world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
 
-            anchorBody = new CANNON.Body({ mass: 0, shape: new CANNON.Sphere(0.1), position: new CANNON.Vec3(0, 25, 0) });
+            anchorBody = new CANNON.Body({
+                mass: 0,
+                shape: new CANNON.Sphere(0.1),
+                position: new CANNON.Vec3(0, 25, 0),
+                collisionFilterGroup: 0,
+                collisionFilterMask: 0
+            });
             world.addBody(anchorBody);
 
             const cardShape = new CANNON.Box(new CANNON.Vec3(4, 5, 0.1));
-            cardBody = new CANNON.Body({ mass: 2, shape: cardShape, position: new CANNON.Vec3(0, 15, 0), angularDamping: 0.5 });
+            cardBody = new CANNON.Body({
+                mass: 2,
+                shape: cardShape,
+                position: new CANNON.Vec3(0, 15, 0),
+                angularDamping: 0.5,
+                angularFactor: new CANNON.Vec3(1, 1, 0), // Only allow rotation in X and Y
+                linearFactor: new CANNON.Vec3(1, 1, 0) // Only allow translation in X and Y
+            });
             world.addBody(cardBody);
 
-            spring = new CANNON.Spring(anchorBody, cardBody, { restLength: 5, stiffness: 80, damping: 2 });
+            // --- Create the rope as a chain of segments using DistanceConstraints ---
+            const numSegments = 15;
+            const segmentLength = 0.6;
+            const segmentMass = 0.1;
+            const segmentShape = new CANNON.Sphere(0.1);
+            const anchorPos = anchorBody.position;
+            let previousSegment: CANNON.Body | null = null;
+
+            for (let i = 0; i < numSegments; i++) {
+                const segment = new CANNON.Body({
+                    mass: i === 0 ? 0 : segmentMass,
+                    shape: segmentShape,
+                    position: new CANNON.Vec3(anchorPos.x, anchorPos.y - (i * segmentLength), anchorPos.z),
+                    linearDamping: 0.5,
+                    angularDamping: 0.5,
+                    collisionFilterGroup: 1,
+                    collisionFilterMask: 1
+                });
+                ropeSegments.push(segment);
+                world.addBody(segment);
+
+                if (previousSegment) {
+                    // Use DistanceConstraint for rigid connection
+                    const constraint = new CANNON.DistanceConstraint(previousSegment, segment, segmentLength);
+                    world.addConstraint(constraint);
+                }
+                previousSegment = segment;
+            }
+
+            // Connect first segment to anchorBody (fixed upper point)
+            const firstSegment = ropeSegments[0];
+            const anchorConstraint = new CANNON.DistanceConstraint(anchorBody, firstSegment, 0);
+            world.addConstraint(anchorConstraint);
+
+            // Connect last rope segment to the top of the card
+            const cardTopLocal = new CANNON.Vec3(0, 5, 0);
+            const lastSegment = ropeSegments[ropeSegments.length - 1];
+            // For card, use a PointToPointConstraint to attach to the top
+            const cardConstraint = new CANNON.PointToPointConstraint(
+                lastSegment, new CANNON.Vec3(0, 0, 0),
+                cardBody, cardTopLocal
+            );
+            world.addConstraint(cardConstraint);
 
             cannonDebugger = CannonDebugger(scene, world, { color: 0xff0000 });
         };
@@ -86,9 +147,10 @@ const HangingCardCanvas: React.FC = () => {
             cardMesh.receiveShadow = true;
             scene.add(cardMesh);
 
+            // Rope line with multiple segments
             const ropeGeometry = new THREE.BufferGeometry();
-            const points = [new THREE.Vector3(), new THREE.Vector3()];
-            ropeGeometry.setFromPoints(points);
+            const points = new Float32Array((ropeSegments.length + 2) * 3); // +2 for anchor and card top
+            ropeGeometry.setAttribute('position', new THREE.BufferAttribute(points, 3));
             const ropeMaterial = new THREE.LineBasicMaterial({ color: 0xffffff });
             ropeLine = new THREE.Line(ropeGeometry, ropeMaterial);
             scene.add(ropeLine);
@@ -155,23 +217,29 @@ const HangingCardCanvas: React.FC = () => {
             requestAnimationFrame(animate);
             controls.update();
             world.step(1 / 60);
-            spring.applyForce();
             cannonDebugger.update();
-
             cardMesh.position.copy(cardBody.position as unknown as THREE.Vector3);
             cardMesh.quaternion.copy(cardBody.quaternion as unknown as THREE.Quaternion);
 
-            const ropePositions = (ropeLine.geometry.attributes.position as THREE.BufferAttribute).array;
-            const anchorPos = anchorBody.position;
-            const cardPos = cardBody.position;
-            ropePositions[0] = anchorPos.x;
-            ropePositions[1] = anchorPos.y;
-            ropePositions[2] = anchorPos.z;
-            ropePositions[3] = cardPos.x;
-            ropePositions[4] = cardPos.y;
-            ropePositions[5] = cardPos.z;
+            // Draw rope: anchor -> all segments -> card top
+            const ropePositions = (ropeLine.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array;
+            // Anchor point
+            ropePositions[0] = anchorBody.position.x;
+            ropePositions[1] = anchorBody.position.y;
+            ropePositions[2] = anchorBody.position.z;
+            // Rope segments
+            for (let i = 0; i < ropeSegments.length; i++) {
+                const segmentPos = ropeSegments[i].position;
+                ropePositions[(i + 1) * 3] = segmentPos.x;
+                ropePositions[(i + 1) * 3 + 1] = segmentPos.y;
+                ropePositions[(i + 1) * 3 + 2] = segmentPos.z;
+            }
+            // Card top in world space
+            const cardTop = new THREE.Vector3(0, 5, 0).applyQuaternion(cardMesh.quaternion).add(cardMesh.position);
+            ropePositions[(ropeSegments.length + 1) * 3] = cardTop.x;
+            ropePositions[(ropeSegments.length + 1) * 3 + 1] = cardTop.y;
+            ropePositions[(ropeSegments.length + 1) * 3 + 2] = cardTop.z;
             (ropeLine.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
-
             renderer.render(scene, camera);
         };
 
